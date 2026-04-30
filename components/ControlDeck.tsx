@@ -6,6 +6,7 @@ interface ControlDeckProps {
   instrumentState: InstrumentState;
   onMacroChange: (key: keyof MacroState, val: MacroValue) => void;
   onInstrumentToggle: (key: keyof InstrumentState) => void;
+  vertical?: boolean;
 }
 
 const MacroControl: React.FC<{
@@ -99,17 +100,35 @@ const InstrumentControl: React.FC<{
 };
 
 const ControlDeck: React.FC<ControlDeckProps> = ({ 
-    macroState, instrumentState, onMacroChange, onInstrumentToggle 
+    macroState, instrumentState, onMacroChange, onInstrumentToggle, vertical = false 
 }) => {
+  if (!vertical) {
+    return (
+      <div className="w-full max-w-5xl bg-[#0a0a0a] rounded-[2.5rem] p-5 px-8 flex items-center justify-between border border-white/5 shadow-2xl backdrop-blur-md">
+        <MacroControl label="Density" value={macroState.density} onChange={(v) => onMacroChange('density', v)} />
+        <div className="h-8 w-px bg-white/5 mx-2" />
+        <MacroControl label="Brightness" value={macroState.brightness} onChange={(v) => onMacroChange('brightness', v)} />
+        <div className="h-8 w-px bg-white/5 mx-2" />
+        <MacroControl label="Chaos" value={macroState.chaos} onChange={(v) => onMacroChange('chaos', v)} />
+        <div className="h-8 w-px bg-white/5 mx-4" />
+        <div className="flex gap-4">
+          <InstrumentControl label="Drums" active={instrumentState.drums} onToggle={() => onInstrumentToggle('drums')} />
+          <InstrumentControl label="Bass" active={instrumentState.bass} onToggle={() => onInstrumentToggle('bass')} />
+          <InstrumentControl label="Other" active={instrumentState.other} onToggle={() => onInstrumentToggle('other')} />
+        </div>
+      </div>
+    );
+  }
+
   return (
-    <div className="w-full max-w-5xl bg-[#0a0a0a] rounded-[2.5rem] p-5 px-8 flex items-center justify-between border border-white/5 shadow-2xl backdrop-blur-md">
+    <div className="w-full max-w-5xl bg-[#0a0a0a] rounded-[2.5rem] p-6 px-8 flex flex-col items-center justify-center border border-white/5 shadow-2xl backdrop-blur-md gap-4">
       <MacroControl label="Density" value={macroState.density} onChange={(v) => onMacroChange('density', v)} />
-      <div className="h-8 w-px bg-white/5 mx-2" />
+      <div className="w-full h-px bg-white/5" />
       <MacroControl label="Brightness" value={macroState.brightness} onChange={(v) => onMacroChange('brightness', v)} />
-      <div className="h-8 w-px bg-white/5 mx-2" />
+      <div className="w-full h-px bg-white/5" />
       <MacroControl label="Chaos" value={macroState.chaos} onChange={(v) => onMacroChange('chaos', v)} />
-      <div className="h-8 w-px bg-white/5 mx-4" />
-      <div className="flex gap-4">
+      <div className="w-full h-px bg-white/5" />
+      <div className="flex items-center justify-center gap-4">
         <InstrumentControl label="Drums" active={instrumentState.drums} onToggle={() => onInstrumentToggle('drums')} />
         <InstrumentControl label="Bass" active={instrumentState.bass} onToggle={() => onInstrumentToggle('bass')} />
         <InstrumentControl label="Other" active={instrumentState.other} onToggle={() => onInstrumentToggle('other')} />

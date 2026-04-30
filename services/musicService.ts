@@ -20,6 +20,31 @@ class MusicService {
     id: string;
   }> = [];
 
+  // Keep a history of buffers delivered so we can export them later
+  private recordedBuffers: Array<{
+    buffer: AudioBuffer;
+    startTime: number;
+    duration: number;
+    id: string;
+  }> = [];
+
+  // Group recorded buffers into playback sessions. Each playback session represents
+  // one continuous play (from play -> pause or until reset). Most sessions will
+  // contain multiple chunks but are exported/edited as a single track.
+  private sessions: Array<{
+    id: string;
+    startTime: number;
+    endTime: number | null;
+    buffers: Array<{ buffer: AudioBuffer; startTime: number; duration: number; id: string }>;
+  }> = [];
+
+  private currentSession: {
+    id: string;
+    startTime: number;
+    endTime: number | null;
+    buffers: Array<{ buffer: AudioBuffer; startTime: number; duration: number; id: string }>;
+  } | null = null;
+
   private isSimulation: boolean = false;
   private simulationInterval: number | null = null;
   private activeNodes: AudioNode[] = [];
@@ -174,6 +199,17 @@ class MusicService {
         id: chunkId
     });
 
+    // store a copy reference for exports
+    try {
+      this.recordedBuffers.push({ buffer: audioBuffer, startTime: chunkStartTime, duration: audioBuffer.duration, id: chunkId });
+      // ensure we have an active session (playback session). If none, create a transient session
+      const now = this.audioContext.currentTime;
+      if (!this.currentSession) {
+        this.currentSession = { id: `s_${Date.now().toString(36)}`, startTime: chunkStartTime, endTime: null, buffers: [] };
+      }
+      this.currentSession.buffers.push({ buffer: audioBuffer, startTime: chunkStartTime, duration: audioBuffer.duration, id: chunkId });
+    } catch (e) { console.warn('Failed to record buffer for export', e); }
+
     this.nextStartTime += audioBuffer.duration;
 
     // --- VISUALIZER PROCESSING ---
@@ -259,7 +295,32 @@ class MusicService {
           this.nextStartTime = this.audioContext.currentTime + 0.1; 
       }
 
+      // End current playback session if any (reset implies closing session)
+      try { this.endSession(); } catch(e) {}
+
       this.emit({ type: 'reset' });
+  }
+
+  // Start a new playback session. Called when playback begins.
+  public startSession() {
+    if (!this.audioContext) this.initAudioContext();
+    if (this.currentSession) return; // already started
+    const now = this.audioContext ? this.audioContext.currentTime : Date.now() / 1000;
+    this.currentSession = { id: `s_${Date.now().toString(36)}`, startTime: now, endTime: null, buffers: [] };
+  }
+
+  // End the current playback session and save it to sessions list
+  public endSession() {
+    if (!this.currentSession) return;
+    // set end time as the end of last buffer if available
+    const last = this.currentSession.buffers.length > 0 ? this.currentSession.buffers[this.currentSession.buffers.length - 1] : null;
+    const endTime = last ? last.startTime + last.duration : (this.audioContext ? this.audioContext.currentTime : Date.now() / 1000);
+    this.currentSession.endTime = endTime;
+    // only keep sessions that have at least one buffer
+    if (this.currentSession.buffers.length > 0) {
+      this.sessions.push(this.currentSession);
+    }
+    this.currentSession = null;
   }
 
   // Trims the future queue to ensure quick response to parameter changes
@@ -381,12 +442,16 @@ class MusicService {
   public async play() {
     if (!this.session) return;
     if (this.audioContext?.state === 'suspended') await this.audioContext.resume();
+    // starting playback marks a new session
+    this.startSession();
     await this.session.play();
   }
 
   public async pause() {
     if (!this.session) return;
     await this.session.pause();
+    // pausing closes current playback session
+    try { this.endSession(); } catch(e) {}
     this.stopSimulationLoop();
   }
 
@@ -408,6 +473,197 @@ class MusicService {
     } else if (this.session.resetContext) {
       await this.session.resetContext();
     }
+  }
+
+  // Export helpers -------------------------------------------------------
+  private encodeWavFromBuffer(buffer: AudioBuffer) {
+    const numChannels = buffer.numberOfChannels;
+    const sampleRate = buffer.sampleRate;
+    const length = buffer.length * numChannels * 2 + 44;
+    const arrayBuffer = new ArrayBuffer(length);
+    const view = new DataView(arrayBuffer);
+
+    /* RIFF identifier */ writeString(view, 0, 'RIFF');
+    /* file length */ view.setUint32(4, 36 + buffer.length * numChannels * 2, true);
+    /* RIFF type */ writeString(view, 8, 'WAVE');
+    /* format chunk identifier */ writeString(view, 12, 'fmt ');
+    /* format chunk length */ view.setUint32(16, 16, true);
+    /* sample format (raw) */ view.setUint16(20, 1, true);
+    /* channel count */ view.setUint16(22, numChannels, true);
+    /* sample rate */ view.setUint32(24, sampleRate, true);
+    /* byte rate (sample rate * block align) */ view.setUint32(28, sampleRate * numChannels * 2, true);
+    /* block align (channel count * bytes per sample) */ view.setUint16(32, numChannels * 2, true);
+    /* bits per sample */ view.setUint16(34, 16, true);
+    /* data chunk identifier */ writeString(view, 36, 'data');
+    /* data chunk length */ view.setUint32(40, buffer.length * numChannels * 2, true);
+
+    // write interleaved PCM16
+    let offset = 44;
+    const channels = [];
+    for (let c = 0; c < numChannels; c++) channels.push(buffer.getChannelData(c));
+    for (let i = 0; i < buffer.length; i++) {
+      for (let c = 0; c < numChannels; c++) {
+        let sample = Math.max(-1, Math.min(1, channels[c][i]));
+        view.setInt16(offset, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true);
+        offset += 2;
+      }
+    }
+
+    function writeString(dataview: DataView, offset: number, str: string) {
+      for (let i = 0; i < str.length; i++) dataview.setUint8(offset + i, str.charCodeAt(i));
+    }
+
+    return new Blob([view], { type: 'audio/wav' });
+  }
+
+  public async exportChunksAsWav() {
+    if (!this.recordedBuffers || this.recordedBuffers.length === 0) return [];
+    const results: Array<{ id: string; blob: Blob; filename: string }> = [];
+    for (const item of this.recordedBuffers) {
+      const blob = this.encodeWavFromBuffer(item.buffer);
+      results.push({ id: item.id, blob, filename: `chunk-${item.id}.wav` });
+    }
+    return results;
+  }
+
+  // Return session metadata (id, startTime, endTime, duration)
+  public getSessions() {
+    // include currentSession as in-progress session if present
+    const out = this.sessions.map(s => ({ id: s.id, startTime: s.startTime, endTime: s.endTime, duration: s.endTime ? s.endTime - s.startTime : null }));
+    if (this.currentSession) out.push({ id: this.currentSession.id, startTime: this.currentSession.startTime, endTime: this.currentSession.endTime, duration: this.currentSession.endTime ? this.currentSession.endTime - this.currentSession.startTime : null });
+    return out;
+  }
+
+  // Mix a session's buffers into a single AudioBuffer (async)
+  public async getMixedSessionBuffer(sessionId: string): Promise<AudioBuffer | null> {
+    const session = this.sessions.find(s => s.id === sessionId) || (this.currentSession && this.currentSession.id === sessionId ? this.currentSession : null);
+    if (!session || session.buffers.length === 0 || !this.audioContext) return null;
+    const sampleRate = this.audioContext.sampleRate || SAMPLE_RATE;
+    // compute relative times to session.startTime
+    let lastEnd = 0;
+    for (const b of session.buffers) {
+      const relStart = b.startTime - session.startTime;
+      lastEnd = Math.max(lastEnd, relStart + b.duration);
+    }
+    const totalSamples = Math.ceil(lastEnd * sampleRate);
+    const offline = new OfflineAudioContext(2, totalSamples, sampleRate);
+    for (const b of session.buffers) {
+      const src = offline.createBufferSource();
+      src.buffer = b.buffer;
+      src.connect(offline.destination);
+      const relStart = Math.max(0, b.startTime - session.startTime);
+      src.start(relStart);
+    }
+    const rendered = await offline.startRendering();
+    return rendered;
+  }
+
+  // Export each session as a separate WAV (mixed)
+  public async exportSessionsAsWav() {
+    const results: Array<{ id: string; blob: Blob; filename: string }> = [];
+    for (const s of this.sessions) {
+      const mixed = await this.getMixedSessionBuffer(s.id);
+      if (!mixed) continue;
+      const blob = this.encodeWavFromBuffer(mixed);
+      results.push({ id: s.id, blob, filename: `session-${s.id}.wav` });
+    }
+    // include currentSession as well if present
+    if (this.currentSession) {
+      const mixed = await this.getMixedSessionBuffer(this.currentSession.id);
+      if (mixed) results.push({ id: this.currentSession.id, blob: this.encodeWavFromBuffer(mixed), filename: `session-${this.currentSession.id}.wav` });
+    }
+    return results;
+  }
+
+  public async exportMixedWav() {
+    if (!this.audioContext) return null;
+    if (!this.recordedBuffers || this.recordedBuffers.length === 0) return null;
+
+    // compute total length in samples
+    let lastEnd = 0;
+    for (const b of this.recordedBuffers) {
+      lastEnd = Math.max(lastEnd, b.startTime + b.duration);
+    }
+    const sampleRate = this.audioContext.sampleRate || SAMPLE_RATE;
+    const totalSamples = Math.ceil(lastEnd * sampleRate);
+
+    const offline = new OfflineAudioContext(2, totalSamples, sampleRate);
+
+    for (const b of this.recordedBuffers) {
+      const src = offline.createBufferSource();
+      src.buffer = b.buffer;
+      src.connect(offline.destination);
+      src.start(b.startTime);
+    }
+
+    const rendered = await offline.startRendering();
+    const blob = this.encodeWavFromBuffer(rendered);
+    return { blob, filename: `session-${Date.now()}.wav` };
+  }
+
+  // Return a shallow copy of recorded buffer metadata for UI
+  public getRecordedBuffers() {
+    return this.recordedBuffers.map(b => ({ id: b.id, startTime: b.startTime, duration: b.duration, buffer: b.buffer }));
+  }
+
+  // Play a preview of a buffer (with optional trim and gain)
+  public async playBufferPreview(buffer: AudioBuffer, trimStart = 0, trimEnd?: number, gain = 1) {
+    this.initAudioContext();
+    if (!this.audioContext || !this.gainNode) return;
+    const src = this.audioContext.createBufferSource();
+    const g = this.audioContext.createGain();
+    src.buffer = buffer;
+    g.gain.value = gain;
+    src.connect(g);
+    g.connect(this.gainNode);
+    const duration = (trimEnd ? Math.min(trimEnd, buffer.duration) : buffer.duration) - trimStart;
+    try {
+      src.start(0, Math.max(0, trimStart), Math.max(0, duration));
+      // stop after duration
+      setTimeout(() => {
+        try { src.stop(); } catch (e) {}
+        try { g.disconnect(); } catch (e) {}
+      }, duration * 1000 + 200);
+    } catch (e) { console.warn('Preview failed', e); }
+  }
+
+  // Export a custom mix based on provided edits. Each edit: { buffer, trimStart, trimEnd, gain, offset }
+  public async exportCustomMix(edits: Array<{ buffer: AudioBuffer; trimStart: number; trimEnd?: number; gain?: number; offset?: number }>) {
+    if (!this.audioContext || edits.length === 0) return null;
+    const sampleRate = this.audioContext.sampleRate || SAMPLE_RATE;
+    // compute total duration
+    let last = 0;
+    for (const e of edits) {
+      const end = (e.offset || 0) + ((e.trimEnd ? e.trimEnd : e.buffer.duration) - (e.trimStart || 0));
+      last = Math.max(last, end);
+    }
+    const totalSamples = Math.ceil(last * sampleRate);
+    const offline = new OfflineAudioContext(2, totalSamples, sampleRate);
+    for (const e of edits) {
+      const src = offline.createBufferSource();
+      // if trim differs from full buffer, create a sliced buffer
+      if ((e.trimStart || 0) === 0 && (!e.trimEnd || e.trimEnd >= e.buffer.duration)) {
+        src.buffer = e.buffer;
+      } else {
+        const start = Math.max(0, e.trimStart || 0);
+        const end = Math.min(e.buffer.duration, e.trimEnd || e.buffer.duration);
+        const len = Math.max(0, Math.floor((end - start) * sampleRate));
+        const sliced = offline.createBuffer(e.buffer.numberOfChannels, len, sampleRate);
+        for (let c = 0; c < e.buffer.numberOfChannels; c++) {
+          const srcCh = e.buffer.getChannelData(c).subarray(Math.floor(start * e.buffer.sampleRate), Math.floor(end * e.buffer.sampleRate));
+          sliced.getChannelData(c).set(srcCh);
+        }
+        src.buffer = sliced;
+      }
+      const gainNode = offline.createGain();
+      gainNode.gain.value = (e.gain !== undefined) ? e.gain : 1;
+      src.connect(gainNode);
+      gainNode.connect(offline.destination);
+      src.start((e.offset || 0));
+    }
+    const rendered = await offline.startRendering();
+    const blob = this.encodeWavFromBuffer(rendered);
+    return { blob, filename: `export-${Date.now()}.wav` };
   }
 }
 
