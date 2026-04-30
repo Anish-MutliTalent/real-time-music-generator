@@ -1,0 +1,6 @@
+{
+  "name": "Real Time Music Generator",
+  "description": "using the Gemini Lyria Realtime API for generative music.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
